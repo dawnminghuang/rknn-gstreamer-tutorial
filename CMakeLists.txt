@@ -10,6 +10,7 @@ pkg_search_module(gstreamer-rtsp REQUIRED IMPORTED_TARGET gstreamer-rtsp-1.0>=1.
 pkg_search_module(gstreamer-rtsp-server REQUIRED IMPORTED_TARGET gstreamer-rtsp-server-1.0>=1.4)
 pkg_search_module(libfontconfig REQUIRED IMPORTED_TARGET fontconfig)
 pkg_search_module(librga REQUIRED IMPORTED_TARGET librga)
+pkg_search_module(libpng REQUIRED IMPORTED_TARGET libpng)
 
 aux_source_directory(./yolov5 SOURCES)
 
@@ -26,6 +27,7 @@ target_link_libraries(gst-test
     PkgConfig::gstreamer-rtsp-server
     PkgConfig::libfontconfig
     PkgConfig::librga
+    PkgConfig::libpng
     rknnrt
 )
 

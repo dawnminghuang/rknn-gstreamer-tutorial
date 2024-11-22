@@ -17,6 +17,10 @@
 #include "rknn/rknn_api.h"
 #include "yolov5/postprocess.h"
 
+#include <png.h>
+#include <iostream>
+#include <fstream>
+
 #define RENDERING_WIDTH 1280
 #define RENDERING_HEIGHT 720
 #define RENDERING_CHANNEL 4
@@ -332,6 +336,68 @@ static int bootstrap_init(int *argc, char ***argv)
     return 0;
 }
 
+void save_image_to_disk(const std::string &file_path, const guint8 *rgba_frame, int width, int height)
+{
+    FILE *fp = fopen(file_path.c_str(), "wb");
+    if (!fp)
+    {
+        std::cerr << "Failed to open file for writing: " << file_path << std::endl;
+        return;
+    }
+
+    // Create PNG write structure
+    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    if (!png_ptr)
+    {
+        std::cerr << "Failed to create PNG write structure." << std::endl;
+        fclose(fp);
+        return;
+    }
+
+    // Create PNG info structure
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr)
+    {
+        std::cerr << "Failed to create PNG info structure." << std::endl;
+        png_destroy_write_struct(&png_ptr, nullptr);
+        fclose(fp);
+        return;
+    }
+
+    // Set error handling
+    if (setjmp(png_jmpbuf(png_ptr)))
+    {
+        std::cerr << "Error during PNG creation." << std::endl;
+        png_destroy_write_struct(&png_ptr, &info_ptr);
+        fclose(fp);
+        return;
+    }
+
+    // Initialize PNG file I/O
+    png_init_io(png_ptr, fp);
+
+    // Write PNG header
+    png_set_IHDR(png_ptr, info_ptr, width, height, 8, PNG_COLOR_TYPE_RGBA,
+                 PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png_ptr, info_ptr);
+
+    // Write image data row by row
+    for (int y = 0; y < height; y++)
+    {
+        png_bytep row = (png_bytep)(rgba_frame + y * width * 4); // 4 bytes per pixel (RGBA)
+        png_write_row(png_ptr, row);
+    }
+
+    // End writing
+    png_write_end(png_ptr, nullptr);
+
+    // Clean up
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+    fclose(fp);
+
+    std::cout << "Image saved to " << file_path << std::endl;
+}
+
 static GstPadProbeReturn process_frame_callback(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
 {
     struct timeval start_time, stop_time;
@@ -342,12 +408,12 @@ static GstPadProbeReturn process_frame_callback(GstPad *pad, GstPadProbeInfo *in
     if (gst_buffer_map(buffer, &map, GST_MAP_READWRITE))
     {
         // Assuming RGB format (video/x-raw, format=RGB)
-        guint8 *rgb_frame = map.data; // Pointer to RGB data
+        guint8 *rgba_frame = map.data; // Pointer to RGB data
 
         gettimeofday(&start_time, NULL);
 
         // Resize the frame using RGA
-        rga_buffer_handle_t src_handle = importbuffer_virtualaddr(rgb_frame, RENDERING_WIDTH * RENDERING_HEIGHT * RENDERING_CHANNEL);
+        rga_buffer_handle_t src_handle = importbuffer_virtualaddr(rgba_frame, RENDERING_WIDTH * RENDERING_HEIGHT * RENDERING_CHANNEL);
         rga_buffer_handle_t dst_handle = importbuffer_virtualaddr(G_DIST_BUFFER, RKNN_WIDTH * RKNN_HEIGHT * RKNN_CHANNEL);
         if (src_handle == 0 || dst_handle == 0)
         {
@@ -411,13 +477,15 @@ static GstPadProbeReturn process_frame_callback(GstPad *pad, GstPadProbeInfo *in
             detect_result_t *det_result = &(detect_result_group.results[i]);
 
             // Draw a box on the RGB frame
-            draw_box_on_rgba_frame(rgb_frame, RENDERING_WIDTH, RENDERING_HEIGHT, det_result->box.left, det_result->box.top,
+            draw_box_on_rgba_frame(rgba_frame, RENDERING_WIDTH, RENDERING_HEIGHT, det_result->box.left, det_result->box.top,
                                    det_result->box.right - det_result->box.left, det_result->box.bottom - det_result->box.top);
 
             // Draw text using FreeType
-            draw_text_on_rgba_frame_freetype(rgb_frame, "./simsun.ttc", RENDERING_WIDTH, RENDERING_HEIGHT, det_result->name,
+            draw_text_on_rgba_frame_freetype(rgba_frame, "./simsun.ttc", RENDERING_WIDTH, RENDERING_HEIGHT, det_result->name,
                                              det_result->box.left, det_result->box.top);
         }
+
+        // save_image_to_disk("output.png", rgba_frame, RENDERING_WIDTH, RENDERING_HEIGHT);
 
         gettimeofday(&stop_time, NULL);
         std::cout << "Inference time: " << (__get_us(stop_time) - __get_us(start_time)) / 1000 << " ms" << std::endl;
@@ -472,7 +540,7 @@ int main(int argc, char *argv[])
     }
 
     // Set RTSP location
-    g_object_set(G_OBJECT(rtspsrc), "location", "rtspt://admin:admin123@192.168.44.138", NULL);
+    g_object_set(G_OBJECT(rtspsrc), "location", "rtspt://admin:admin123@172.16.160.15:554/Streaming/Channels/101?transportmode=unicast&profile=Profile_1", NULL);
 
     // Create caps for scaling and filtering
     GstCaps *scale_caps = gst_caps_new_simple("video/x-raw",
