@@ -1,10 +1,8 @@
-### Gstreamer
+### RKNN GSTREAMER TUTORIAL
 
 ```bash
-# gstreamer
+# dependencies
 sudo apt install libgstrtspserver-1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev librga-dev
-
-# rknn
 wget https://raw.githubusercontent.com/airockchip/rknn-toolkit2/refs/heads/master/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so
 ```
 
@@ -17,7 +15,7 @@ export GST_DEBUG=3
 export DISPLAY=:0.0
 ```
 
-<img src="demo.jpg" title="DEMO" width="50%">
+<img src="demo.jpg" title="DEMO" width="75%">
 
 ```bash
 # file
