@@ -34,34 +34,104 @@
 
 double __get_us(struct timeval t) { return (t.tv_sec * 1000000 + t.tv_usec); }
 
-static void on_pad_added(GstElement *src, GstPad *new_pad, gpointer data)
-{
-    GstElement *depay = (GstElement *)data;
+// --- Custom Data Structure ---
+// A structure to hold all our GStreamer elements, making them accessible in callbacks.
+typedef struct _CustomData {
+    GstElement *pipeline;
+    GstElement *source;         // either rtspsrc or filesrc
+    GstElement *depay;          // only for rtsp
+    GstElement *demuxer;        // only for local file
+    GstElement *parse;
+    GstElement *decoder;
+    GstElement *videoscale;
+    GstElement *scale_capsfilter;
+    GstElement *videoconvert;
+    GstElement *rgb_capsfilter;
+    GstElement *sink;
+    GMainLoop *main_loop;
+} CustomData;
 
-    // Get the sink pad of the next element in the pipeline (rtph264depay)
-    GstPad *sink_pad = gst_element_get_static_pad(depay, "sink");
+/**
+ * @brief Callback function for dynamically linking pads.
+ * This function can now handle both rtspsrc and qtdemux.
+ */
+static void on_pad_added(GstElement *src_element, GstPad *new_pad, CustomData *data) {
+    g_print("Dynamic pad created, linking...\n");
 
-    // Check if the sink pad is already linked
-    if (gst_pad_is_linked(sink_pad))
-    {
-        gst_object_unref(sink_pad);
-        return;
+    GstCaps *new_pad_caps = gst_pad_get_current_caps(new_pad);
+    const gchar *new_pad_type = gst_structure_get_name(gst_caps_get_structure(new_pad_caps, 0));
+    sleep(1);
+    gchar *caps_str = gst_caps_to_string(new_pad_caps);
+    g_print("Demuxer new pad caps: %s\n", caps_str);
+    GstPad *sink_pad = gst_element_get_static_pad(data->parse, "sink");
+    GstCaps *sink_caps = gst_pad_query_caps(sink_pad, NULL);
+    gchar *sink_caps_str = gst_caps_to_string(sink_caps);
+    g_print("h264parse sink pad caps: %s\n", sink_caps_str);
+    g_free(caps_str);
+    g_free(sink_caps_str);
+    gst_caps_unref(sink_caps);
+
+    // Link only if the media type is H264 video
+    if (g_str_has_prefix(new_pad_type, "video/x-h264")) {
+        g_print("Dynamic pad created, linking 264...\n");
+        // Check which element the pad comes from, then get the sink pad of the next element in the chain
+        const gchar *src_element_name = gst_element_get_name(src_element);
+        if (g_strcmp0(src_element_name, "rtspsrc") == 0) {
+            sink_pad = gst_element_get_static_pad(data->depay, "sink");
+        } else if (g_strcmp0(src_element_name, "demuxer") == 0) {
+            g_print("Dynamic pad created, linking demuxer...\n");
+            sink_pad = gst_element_get_static_pad(data->parse, "sink");
+        } else {
+            g_warning("Pad added from unexpected element: %s", src_element_name);
+            goto exit;
+        }
+
+        if (gst_pad_is_linked(sink_pad)) {
+            g_print("Sink pad is already linked. Ignoring.\n");
+            goto exit;
+        }
+
+        GstPadLinkReturn ret = gst_pad_link(new_pad, sink_pad);
+        if (GST_PAD_LINK_FAILED(ret)) {
+            g_warning("Failed to link dynamic pad.");
+        } else {
+            g_print("Dynamic pad linked successfully.\n");
+        }
     }
 
-    // Attempt to link the new pad (source pad of rtspsrc) to the sink pad of depay
-    GstPadLinkReturn ret = gst_pad_link(new_pad, sink_pad);
-    if (GST_PAD_LINK_FAILED(ret))
-    {
-        std::cerr << "Link failed" << std::endl;
-    }
-    else
-    {
-        std::cout << "Link succeeded" << std::endl;
-    }
-
-    gst_object_unref(sink_pad);
+exit:
+    // Unreference the resources we created
+    if (new_pad_caps != NULL) gst_caps_unref(new_pad_caps);
+    if (sink_pad != NULL) gst_object_unref(sink_pad);
 }
 
+/**
+ * @brief Callback function to handle messages from the bus (like errors, EOS).
+ */
+static gboolean on_bus_message(GstBus *bus, GstMessage *msg, CustomData *data) {
+    switch (GST_MESSAGE_TYPE(msg)) {
+        case GST_MESSAGE_ERROR: {
+            GError *err;
+            gchar *debug_info;
+            gst_message_parse_error(msg, &err, &debug_info);
+            g_printerr("Error received from element %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
+            g_printerr("Debugging information: %s\n", debug_info ? debug_info : "none");
+            g_clear_error(&err);
+            g_free(debug_info);
+            g_main_loop_quit(data->main_loop);
+            break;
+        }
+        case GST_MESSAGE_EOS:
+            g_print("End-Of-Stream reached.\n");
+            g_main_loop_quit(data->main_loop);
+            break;
+        default:
+            // We are not interested in other messages
+            break;
+    }
+    // Return TRUE to keep the bus watch active
+    return TRUE;
+}
 // Function to draw a rectangle on an RGB frame
 void draw_box_on_rgb_frame(guint8 *rgb_frame, int width, int height, int x, int y, int box_width, int box_height)
 {
@@ -402,7 +472,7 @@ static GstPadProbeReturn process_frame_callback(GstPad *pad, GstPadProbeInfo *in
 {
     struct timeval start_time, stop_time;
     GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
-
+    g_print("process_frame_callback ...\n");
     // Map the buffer to access frame data
     GstMapInfo map;
     if (gst_buffer_map(buffer, &map, GST_MAP_READWRITE))
@@ -411,17 +481,36 @@ static GstPadProbeReturn process_frame_callback(GstPad *pad, GstPadProbeInfo *in
         guint8 *rgba_frame = map.data; // Pointer to RGB data
 
         gettimeofday(&start_time, NULL);
-
+        g_print("gst_buffer_map ...\n");
         // Resize the frame using RGA
-        rga_buffer_handle_t src_handle = importbuffer_virtualaddr(rgba_frame, RENDERING_WIDTH * RENDERING_HEIGHT * RENDERING_CHANNEL);
-        rga_buffer_handle_t dst_handle = importbuffer_virtualaddr(G_DIST_BUFFER, RKNN_WIDTH * RKNN_HEIGHT * RKNN_CHANNEL);
-        if (src_handle == 0 || dst_handle == 0)
-        {
-            return GST_PAD_PROBE_OK;
-        }
+        // rga_buffer_handle_t src_handle = importbuffer_virtualaddr(rgba_frame, RENDERING_WIDTH * RENDERING_HEIGHT * RENDERING_CHANNEL);
+        // rga_buffer_handle_t dst_handle = importbuffer_virtualaddr(G_DIST_BUFFER, RKNN_WIDTH * RKNN_HEIGHT * RKNN_CHANNEL);
+        // if (src_handle == 0 || dst_handle == 0)
+        // {
+        //     g_print("gst_buffer_map %d, dst_handle:%d...\n", src_handle, dst_handle);
+        //     return GST_PAD_PROBE_OK;
+        // }
 
-        rga_buffer_t src_img = wrapbuffer_handle(src_handle, RENDERING_WIDTH, RENDERING_HEIGHT, RK_FORMAT_RGBA_8888);
-        rga_buffer_t dst_img = wrapbuffer_handle(dst_handle, RKNN_WIDTH, RKNN_HEIGHT, RK_FORMAT_RGB_888);
+         
+        // rga_buffer_t src_img = wrapbuffer_handle(src_handle, RENDERING_WIDTH, RENDERING_HEIGHT, RK_FORMAT_BGRA_8888);
+        // rga_buffer_t dst_img = wrapbuffer_handle(dst_handle, RKNN_WIDTH, RKNN_HEIGHT, RK_FORMAT_RGB_888);
+
+        rga_buffer_t src_img = {0};
+        rga_buffer_t dst_img = {0};
+        src_img.vir_addr = (void *)rgba_frame; 
+        src_img.width = RENDERING_WIDTH;
+        src_img.height = RENDERING_HEIGHT;
+        src_img.format = RK_FORMAT_RGBA_8888;
+        src_img.wstride = RENDERING_WIDTH; 
+        src_img.hstride = RENDERING_HEIGHT;
+
+        dst_img.vir_addr = (void *)G_DIST_BUFFER;
+        dst_img.width = RKNN_WIDTH;
+        dst_img.height = RKNN_HEIGHT;
+        dst_img.format = RK_FORMAT_RGB_888;
+        dst_img.wstride = RKNN_WIDTH;
+        dst_img.hstride = RKNN_HEIGHT;
+
 
         int ret = imcheck(src_img, dst_img, {}, {});
         if (ret != IM_STATUS_NOERROR)
@@ -432,7 +521,7 @@ static GstPadProbeReturn process_frame_callback(GstPad *pad, GstPadProbeInfo *in
         ret = imresize(src_img, dst_img);
         if (ret != IM_STATUS_SUCCESS)
         {
-            std::cerr << "imresize failed" << std::endl;
+             g_print("imresize failed");
             return GST_PAD_PROBE_OK;
         }
 
@@ -489,7 +578,7 @@ static GstPadProbeReturn process_frame_callback(GstPad *pad, GstPadProbeInfo *in
 
         gettimeofday(&stop_time, NULL);
         std::cout << "Inference time: " << (__get_us(stop_time) - __get_us(start_time)) / 1000 << " ms" << std::endl;
-
+        g_print("gst_buffer_map out...\n");
         rknn_outputs_release(G_RKNN_CONTEXT, G_IO_NUM.n_output, outputs);
 
         // Unmap when done
@@ -499,90 +588,137 @@ static GstPadProbeReturn process_frame_callback(GstPad *pad, GstPadProbeInfo *in
     return GST_PAD_PROBE_OK;
 }
 
-int main(int argc, char *argv[])
-{
+// --- Main Function ---
+int main(int argc, char *argv[]) {
+    CustomData data = {0}; // Initialize our data structure to zeros
+    gchar *uri;
+
+    // Your custom initialization
     bootstrap_init(&argc, &argv);
 
+    // Initialize GStreamer
     gst_init(&argc, &argv);
 
-    // Create GStreamer pipeline
-    GstElement *pipeline = gst_pipeline_new("video-pipeline");
+   // Check for command-line arguments. If there are none, use a default URI.
+    if (argc < 2) {
+        uri = "/userdata/test/car.mp4";
+        g_print("No URI provided. Using default: %s\n", uri);
+    } else {
+        uri = argv[1];
+    }
 
-    // Create elements
-    GstElement *rtspsrc = gst_element_factory_make("rtspsrc", "rtspsrc");
-    GstElement *depay = gst_element_factory_make("rtph264depay", "depay");
-    GstElement *parse = gst_element_factory_make("h264parse", "parse");
-    GstElement *decoder = gst_element_factory_make("mppvideodec", "decoder");
+    // --- 1. Create all potentially used elements ---
+    // We will selectively use them based on the URI type
+    data.pipeline = gst_pipeline_new("video-pipeline");
 
-    GstElement *videoscale = gst_element_factory_make("videoscale", "videoscale");
-    GstElement *scale_capsfilter = gst_element_factory_make("capsfilter", "scale_capsfilter");
+    // a. Common elements (used in both modes)
+    data.parse = gst_element_factory_make("h264parse", "parse");
+    data.decoder = gst_element_factory_make("mppvideodec", "decoder");
+    data.videoscale = gst_element_factory_make("videoscale", "videoscale");
+    data.scale_capsfilter = gst_element_factory_make("capsfilter", "scale_capsfilter");
+    data.videoconvert = gst_element_factory_make("videoconvert", "videoconvert");
+    data.rgb_capsfilter = gst_element_factory_make("capsfilter", "rgb_capsfilter");
+    data.sink = gst_element_factory_make("waylandsink", "sink");
 
-    GstElement *videoconvert = gst_element_factory_make("videoconvert", "videoconvert");
-    GstElement *rgb_capsfilter = gst_element_factory_make("capsfilter", "rgb_capsfilter");
+    // --- 2. Determine URI type and build the data source ---
+    if (g_str_has_prefix(uri, "rtsp://")) {
+        g_print("Input is an RTSP stream. Building network pipeline...\n");
+        // b. RTSP-specific elements
+        data.source = gst_element_factory_make("rtspsrc", "rtspsrc");
+        data.depay = gst_element_factory_make("rtph264depay", "depay");
+        g_object_set(data.source, "location", uri, NULL);
+
+    } else {
+        g_print("Input is a local file. Building file pipeline...\n");
+        // c. Local file-specific elements
+        data.source = gst_element_factory_make("filesrc", "filesrc");
+        data.demuxer = gst_element_factory_make("qtdemux", "demuxer");
+        g_object_set(data.source, "location", uri, NULL);
+    }
+
+    // Check if all elements were created successfully
+    if (!data.pipeline || !data.source || !data.parse || !data.decoder || !data.videoscale || !data.scale_capsfilter ||
+        !data.videoconvert || !data.sink) {
+        g_error("Failed to create one or more elements");
+        return -1;
+    }
+    if ((!data.depay && g_str_has_prefix(uri, "rtsp://")) || (!data.demuxer && !g_str_has_prefix(uri, "rtsp://"))){
+        g_error("Failed to create source-specific elements");
+        return -1;
+    }
+
+    g_print("Input is a local file.configure caps...\n");
+    // --- 3. Configure Caps and Properties ---
+    GstCaps *scale_caps = gst_caps_new_simple("video/x-raw", "width", G_TYPE_INT, RENDERING_WIDTH,
+                                              "height", G_TYPE_INT, RENDERING_HEIGHT, NULL);
+    g_object_set(data.scale_capsfilter, "caps", scale_caps, NULL);
+    gst_caps_unref(scale_caps);
+
+    GstCaps *rgb_caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRA", NULL);
+    g_object_set(data.rgb_capsfilter, "caps", rgb_caps, NULL);
+    gst_caps_unref(rgb_caps);
 
     const gchar *property_name = "render-rectangle";
     GValue render_rectangle = G_VALUE_INIT;
     g_value_init(&render_rectangle, GST_TYPE_ARRAY);
     int coords[] = {0, 0, RENDERING_WIDTH, RENDERING_HEIGHT};
-    for (int i = 0; i < 4; i++)
-    {
+    for (int i = 0; i < 4; i++) {
         GValue val = G_VALUE_INIT;
         g_value_init(&val, G_TYPE_INT);
         g_value_set_int(&val, coords[i]);
         gst_value_array_append_value(&render_rectangle, &val);
+        g_value_unset(&val);
     }
-    GstElement *sink = gst_element_factory_make_with_properties("waylandsink", 1, &property_name, &render_rectangle);
+    g_object_set_property(G_OBJECT(data.sink), property_name, &render_rectangle);
+    g_value_unset(&render_rectangle);
 
-    if (!pipeline || !rtspsrc || !depay || !parse || !decoder || !videoscale || !scale_capsfilter || !videoconvert || !rgb_capsfilter || !sink)
-    {
-        g_error("Failed to create elements");
+    // --- 4. Add and link the common elements ---
+    gst_bin_add_many(GST_BIN(data.pipeline), data.parse, data.decoder, data.videoscale, data.scale_capsfilter,
+                     data.videoconvert, data.rgb_capsfilter, data.sink, NULL);
+
+    if (!gst_element_link_many(data.parse, data.decoder, data.videoscale, data.scale_capsfilter,
+                               data.videoconvert, data.rgb_capsfilter, data.sink, NULL)) {
+        g_error("Failed to link common elements");
+        gst_object_unref(data.pipeline);
         return -1;
     }
 
-    // Set RTSP location
-    g_object_set(G_OBJECT(rtspsrc), "location", "rtspt://admin:admin123@172.16.160.15:554/Streaming/Channels/101?transportmode=unicast&profile=Profile_1", NULL);
+    // --- 2. Determine URI type and build the data source ---
+    if (g_str_has_prefix(uri, "rtsp://")) {
+        g_print("Input is an RTSP stream. Building network pipeline...\n");
+        gst_bin_add_many(GST_BIN(data.pipeline), data.source, data.depay, NULL);
+        gst_element_link(data.depay, data.parse);
+        g_signal_connect(data.source, "pad-added", G_CALLBACK(on_pad_added), &data);
 
-    // Create caps for scaling and filtering
-    GstCaps *scale_caps = gst_caps_new_simple("video/x-raw",
-                                              "width", G_TYPE_INT, RENDERING_WIDTH,
-                                              "height", G_TYPE_INT, RENDERING_HEIGHT,
-                                              "pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1,
-                                              NULL);
-    g_object_set(G_OBJECT(scale_capsfilter), "caps", scale_caps, NULL);
-    gst_caps_unref(scale_caps);
+    } else {
+        g_print("Input is a local file. Building file pipeline...\n");
 
-    // Create caps for RGB format
-    GstCaps *rgb_caps = gst_caps_new_simple("video/x-raw",
-                                            "format", G_TYPE_STRING, "RGBA",
-                                            NULL);
-    g_object_set(G_OBJECT(rgb_capsfilter), "caps", rgb_caps, NULL);
-    gst_caps_unref(rgb_caps);
-
-    // Add elements to the pipeline
-    gst_bin_add_many(GST_BIN(pipeline), rtspsrc, depay, parse, decoder, videoscale, scale_capsfilter, videoconvert, rgb_capsfilter, sink, NULL);
-
-    // Link elements (except for rtspsrc)
-    gst_element_link_many(depay, parse, decoder, videoscale, scale_capsfilter, videoconvert, rgb_capsfilter, sink, NULL);
-
-    // Connect the dynamic pad for rtspsrc
-    g_signal_connect(rtspsrc, "pad-added", G_CALLBACK(on_pad_added), depay);
+        gst_bin_add_many(GST_BIN(data.pipeline), data.source, data.demuxer, NULL);
+        gst_element_link(data.source, data.demuxer);
+        g_signal_connect(data.demuxer, "pad-added", G_CALLBACK(on_pad_added), &data);
+    }
 
     // Add buffer probe for RGB processing on the rgb_capsfilter's src pad
-    GstPad *rgb_capsfilter_src_pad = gst_element_get_static_pad(rgb_capsfilter, "src");
+    GstPad *rgb_capsfilter_src_pad = gst_element_get_static_pad(data.rgb_capsfilter, "src");
     gst_pad_add_probe(rgb_capsfilter_src_pad, GST_PAD_PROBE_TYPE_BUFFER, process_frame_callback, NULL, NULL);
     gst_object_unref(rgb_capsfilter_src_pad);
+    // --- 5. Run the main loop ---
+    GstBus *bus = gst_element_get_bus(data.pipeline);
+    gst_bus_add_watch(bus, (GstBusFunc)on_bus_message, &data);
+    gst_object_unref(bus);
 
-    // Start playing the pipeline
-    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    gst_element_set_state(data.pipeline, GST_STATE_READY);
+    g_print("Starting pipeline ready...\n");
+    gst_element_set_state(data.pipeline, GST_STATE_PLAYING);
 
-    // Run the main loop
-    GMainLoop *main_loop = g_main_loop_new(NULL, FALSE);
-    g_main_loop_run(main_loop);
+    data.main_loop = g_main_loop_new(NULL, FALSE);
+    g_main_loop_run(data.main_loop);
 
-    // Clean up
-    gst_element_set_state(pipeline, GST_STATE_NULL);
-    gst_object_unref(pipeline);
-    g_main_loop_unref(main_loop);
+    // --- 6. Clean up resources ---
+    g_print("Cleaning up...\n");
+    gst_element_set_state(data.pipeline, GST_STATE_NULL);
+    gst_object_unref(data.pipeline);
+    g_main_loop_unref(data.main_loop);
 
     return 0;
 }
