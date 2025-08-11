@@ -9,7 +9,9 @@ export SYSROOT_PATH=${SYS_ROOT}
 export PKG_CONFIG_PATH=${SYS_ROOT}/usr/lib/pkgconfig
 export PKG_CONFIG_SYSROOT_DIR=${SYSROOT_PATH}
 export CC=${TOOL_CHAIN}-gcc
-export CXX=${TOOL_CHAIN}-g++
+export CXX="${TOOL_CHAIN}-g++ -g"
+export CFLAGS="-g"
+export CXXFLAGS="-g"
 
 ROOT_PWD=$( cd "$( dirname $0 )" && cd -P "$( dirname "$SOURCE" )" && pwd )
 
@@ -22,7 +24,7 @@ if [[ ! -d "${BUILD_DIR}" ]]; then
 fi
 
 cd ${BUILD_DIR}
-cmake ../.. -DCMAKE_SYSTEM_NAME=Linux -DTARGET_SOC=${TARGET_SOC} -DCMAKE_SYSROOT=${SYSROOT_PATH}
+cmake ../.. -DCMAKE_SYSTEM_NAME=Linux -DTARGET_SOC=${TARGET_SOC} -DCMAKE_SYSROOT=${SYSROOT_PATH} -DCMAKE_BUILD_TYPE=Debug
 make -j4
 make install
 cd -

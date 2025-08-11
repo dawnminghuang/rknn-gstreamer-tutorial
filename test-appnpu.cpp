@@ -21,8 +21,8 @@
 #include <iostream>
 #include <fstream>
 
-#define RENDERING_WIDTH 1280
-#define RENDERING_HEIGHT 720
+#define RENDERING_WIDTH 720
+#define RENDERING_HEIGHT 1280
 #define RENDERING_CHANNEL 4
 
 #define RKNN_WIDTH 640
@@ -33,6 +33,10 @@
 #define BOX_THRESH 0.25
 
 double __get_us(struct timeval t) { return (t.tv_sec * 1000000 + t.tv_usec); }
+
+// 1. 全局变量保存实际渲染宽高
+int g_rendering_width = 0;
+int g_rendering_height = 0;
 
 // --- Custom Data Structure ---
 // A structure to hold all our GStreamer elements, making them accessible in callbacks.
@@ -49,61 +53,242 @@ typedef struct _CustomData {
     GstElement *rgb_capsfilter;
     GstElement *sink;
     GMainLoop *main_loop;
+    gboolean is_eos_handling_active;
 } CustomData;
+
+// 2. 更新渲染相关属性
+static void update_rendering_properties(CustomData *data, int width, int height) {
+    GstCaps *scale_caps = gst_caps_new_simple("video/x-raw", "width", G_TYPE_INT, width,
+                                              "height", G_TYPE_INT, height, NULL);
+    g_object_set(data->scale_capsfilter, "caps", scale_caps, NULL);
+    gst_caps_unref(scale_caps);
+    GstCaps *rgb_caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRA", NULL);
+    g_object_set(data->rgb_capsfilter, "caps", rgb_caps, NULL);
+    gst_caps_unref(rgb_caps);
+    const gchar *property_name = "render-rectangle";
+    GValue render_rectangle = G_VALUE_INIT;
+    g_value_init(&render_rectangle, GST_TYPE_ARRAY);
+    int coords[] = {0, 0, width, height};
+    for (int i = 0; i < 4; i++) {
+        GValue val = G_VALUE_INIT;
+        g_value_init(&val, G_TYPE_INT);
+        g_value_set_int(&val, coords[i]);
+        gst_value_array_append_value(&render_rectangle, &val);
+        g_value_unset(&val);
+    }
+    g_object_set_property(G_OBJECT(data->sink), property_name, &render_rectangle);
+    g_value_unset(&render_rectangle);
+}
+
+// decoder src pad caps event probe
+static GstPadProbeReturn decoder_caps_event_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) { 
+    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) {
+        GstEvent *event = GST_PAD_PROBE_INFO_EVENT(info);
+        if (GST_EVENT_TYPE(event) == GST_EVENT_CAPS) {
+            GstCaps *caps;
+            gst_event_parse_caps(event, &caps);
+            if (caps) {
+                const GstStructure *str = gst_caps_get_structure(caps, 0);
+                int width = 0, height = 0;
+                if (gst_structure_get_int(str, "width", &width) && gst_structure_get_int(str, "height", &height)) {
+                    CustomData *data = (CustomData *)user_data;
+                    if (width > 0 && height > 0 && (width != g_rendering_width || height != g_rendering_height)) {
+                        //g_rendering_width = width;
+                        //g_rendering_height = height;
+                        //update_rendering_properties(data, width, height);
+                        g_print("[Probe] Update rendering size: %dx%d\n", width, height);
+                    }
+                }
+            }
+        }
+    }
+    return GST_PAD_PROBE_PASS;
+}
+
 
 /**
  * @brief Callback function for dynamically linking pads.
  * This function can now handle both rtspsrc and qtdemux.
  */
 static void on_pad_added(GstElement *src_element, GstPad *new_pad, CustomData *data) {
-    g_print("Dynamic pad created, linking...\n");
+    GstCaps *new_pad_caps = NULL;
+    GstStructure *new_pad_struct = NULL;
+    const gchar *new_pad_media_type = NULL;
+    const gchar *new_pad_encoding_name = NULL;
+    const gchar *caps_struct_name = NULL;
+    gchar *caps_str_debug = NULL;
+    GstElement *depay = NULL;
+    GstElement *parse = NULL; // Parse 通常在 depay 之后
+    GstPad *target_sink_pad = NULL; // 用于链接到 depayloader 的 sink pad
+    const gchar *src_element_name = NULL;
 
-    GstCaps *new_pad_caps = gst_pad_get_current_caps(new_pad);
-    const gchar *new_pad_type = gst_structure_get_name(gst_caps_get_structure(new_pad_caps, 0));
-    sleep(1);
-    gchar *caps_str = gst_caps_to_string(new_pad_caps);
-    g_print("Demuxer new pad caps: %s\n", caps_str);
-    GstPad *sink_pad = gst_element_get_static_pad(data->parse, "sink");
-    GstCaps *sink_caps = gst_pad_query_caps(sink_pad, NULL);
-    gchar *sink_caps_str = gst_caps_to_string(sink_caps);
-    g_print("h264parse sink pad caps: %s\n", sink_caps_str);
-    g_free(caps_str);
-    g_free(sink_caps_str);
-    gst_caps_unref(sink_caps);
+    g_print("Dynamic pad '%s' created from '%s', linking...\n", GST_PAD_NAME(new_pad), GST_ELEMENT_NAME(src_element));
 
-    // Link only if the media type is H264 video
-    if (g_str_has_prefix(new_pad_type, "video/x-h264")) {
-        g_print("Dynamic pad created, linking 264...\n");
-        // Check which element the pad comes from, then get the sink pad of the next element in the chain
-        const gchar *src_element_name = gst_element_get_name(src_element);
-        if (g_strcmp0(src_element_name, "rtspsrc") == 0) {
-            sink_pad = gst_element_get_static_pad(data->depay, "sink");
-        } else if (g_strcmp0(src_element_name, "demuxer") == 0) {
-            g_print("Dynamic pad created, linking demuxer...\n");
-            sink_pad = gst_element_get_static_pad(data->parse, "sink");
-        } else {
-            g_warning("Pad added from unexpected element: %s", src_element_name);
+    new_pad_caps = gst_pad_get_current_caps(new_pad);
+    if (!new_pad_caps) {
+        new_pad_caps = gst_pad_query_caps(new_pad, NULL); // 尝试查询
+        if (!new_pad_caps) {
+            g_warning("Could not get caps for new pad.");
             goto exit;
-        }
-
-        if (gst_pad_is_linked(sink_pad)) {
-            g_print("Sink pad is already linked. Ignoring.\n");
-            goto exit;
-        }
-
-        GstPadLinkReturn ret = gst_pad_link(new_pad, sink_pad);
-        if (GST_PAD_LINK_FAILED(ret)) {
-            g_warning("Failed to link dynamic pad.");
-        } else {
-            g_print("Dynamic pad linked successfully.\n");
         }
     }
 
-exit:
-    // Unreference the resources we created
+    new_pad_struct = gst_caps_get_structure(new_pad_caps, 0);
+    caps_struct_name = gst_structure_get_name(new_pad_struct); // 例如 "application/x-rtp"
+
+    caps_str_debug = gst_caps_to_string(new_pad_caps);
+    g_print("New pad caps: %s\n", caps_str_debug);
+    g_free(caps_str_debug);
+
+    src_element_name = gst_element_get_name(src_element);
+    if (g_strcmp0(src_element_name, "rtspsrc") == 0) {
+        // --- 处理 RTSP 源 ---
+        if (g_strcmp0(caps_struct_name, "application/x-rtp") == 0) {
+            new_pad_media_type = gst_structure_get_string(new_pad_struct, "media");
+            new_pad_encoding_name = gst_structure_get_string(new_pad_struct, "encoding-name");
+            if (g_strcmp0(new_pad_media_type, "video") == 0) {
+                if (g_strcmp0(new_pad_encoding_name, "H265") == 0) {
+                    depay = gst_element_factory_make("rtph265depay", "rtph265depay");
+                    parse = gst_element_factory_make("h265parse", "h265parse");
+                } else if (g_strcmp0(new_pad_encoding_name, "H264") == 0) {
+                    depay = gst_element_factory_make("rtph264depay", "rtph264depay");
+                    parse = gst_element_factory_make("h264parse", "h264parse");
+                } else if (g_strcmp0(new_pad_encoding_name, "JPEG") == 0) {
+                    depay = gst_element_factory_make("rtpjpegdepay", "rtpjpegdepay");
+                    parse = gst_element_factory_make("jpegparse", "jpegparse"); // 或者可能直接到 decoder
+                }
+                // ... 添加对其他视频格式的支持，如 VP8, VP9 ...
+
+                if (depay && parse) {
+                    gst_bin_add_many(GST_BIN(data->pipeline), depay, parse, NULL);
+                    gst_element_sync_state_with_parent(depay);
+                    gst_element_sync_state_with_parent(parse);
+
+                    target_sink_pad = gst_element_get_static_pad(depay, "sink");
+                    if (gst_pad_link(new_pad, target_sink_pad) != GST_PAD_LINK_OK) {
+                        g_printerr("Failed to link rtspsrc new video pad to depayloader sink pad.\n");
+                        gst_object_unref(target_sink_pad);
+                        goto exit; // 或者进行更细致的错误处理
+                    }
+                    gst_object_unref(target_sink_pad); // 释放对 depay sink pad 的引用
+
+                    if (!gst_element_link(depay, parse)) {
+                        g_printerr("Failed to link depayloader to parser.\n");
+                        goto exit;
+                    }
+                    if (!gst_element_link(parse, data->decoder)) {
+                        g_printerr("Failed to link parser to decoder.\n");
+                        goto exit;
+                    }
+                    g_print("Successfully linked RTSP H265 video stream.\n");
+
+                    // 为 decoder 的 src pad 添加 probe (通常只在视频流链接成功后做一次)
+                    // 你可能需要一个标志来确保这只被添加一次
+                    static gboolean video_decoder_probe_added = FALSE;
+                    if (!video_decoder_probe_added) {
+                        GstPad *decoder_src_pad = gst_element_get_static_pad(data->decoder, "src");
+                        if (decoder_src_pad) {
+                            gst_pad_add_probe(decoder_src_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, decoder_caps_event_probe, data, NULL);
+                            gst_object_unref(decoder_src_pad);
+                            video_decoder_probe_added = TRUE;
+                        }
+                    }
+
+                } else {
+                    g_warning("Unsupported RTSP video encoding: %s", new_pad_encoding_name);
+                }
+
+            } else if (g_strcmp0(new_pad_media_type, "audio") == 0) {
+                if (g_strcmp0(new_pad_encoding_name, "PCMA") == 0) {
+                    depay = gst_element_factory_make("rtppcmadepay", "rtppcmadepay");
+                } else if (g_strcmp0(new_pad_encoding_name, "PCMU") == 0) {
+                    depay = gst_element_factory_make("rtppcmudepay", "rtppcmudepay");
+                } else if (g_strcmp0(new_pad_encoding_name, "OPUS") == 0) { // 示例：添加 Opus 支持
+                    depay = gst_element_factory_make("rtpopusdepay", "rtpopusdepay");
+                    // parse = gst_element_factory_make("opusparse", "opusparse"); // Opus 可能需要 parse
+                }
+                if (depay) {
+                    gst_bin_add(GST_BIN(data->pipeline), depay);
+                    gst_element_sync_state_with_parent(depay);
+                    // 如果你不需要处理音频，可以链接到 fakesink
+                    GstElement* audiosink = gst_element_factory_make("fakesink", "audiosink_fake");
+                    gst_bin_add(GST_BIN(data->pipeline), audiosink);
+                    gst_element_sync_state_with_parent(audiosink);
+
+                    target_sink_pad = gst_element_get_static_pad(depay, "sink");
+                    if (gst_pad_link(new_pad, target_sink_pad) != GST_PAD_LINK_OK) {
+                        g_printerr("Failed to link rtspsrc new audio pad to depayloader sink pad.\n");
+                        gst_object_unref(target_sink_pad);
+                        goto exit;
+                    }
+                    gst_object_unref(target_sink_pad);
+
+                    if (!gst_element_link(depay, audiosink)) { // 链接到 fakesink
+                        g_printerr("Failed to link audio depayloader to fakesink.\n");
+                    } else {
+                        g_print("Successfully linked RTSP %s audio stream to fakesink.\n", new_pad_encoding_name);
+                    }
+                } else {
+                    g_warning("Unsupported RTSP audio encoding: %s", new_pad_encoding_name);
+                }
+            } else {
+                g_print("Ignoring unknown media type from rtspsrc: %s\n", new_pad_media_type);
+            }
+        }
+    } else if (g_strcmp0(src_element_name, "demuxer") == 0) {
+        // --- 处理文件源 (demuxer) ---
+        // 你这里的逻辑是检查 caps_struct_name 是否以 "video/" 开头
+        // 例如: if (g_str_has_prefix(caps_struct_name, "video/x-h265"))
+        // 这部分逻辑需要根据 demuxer 输出的具体 caps 来调整
+        // 例如，qtdemux 输出的 pad 的 caps name 直接就是 "video/x-h265" 等
+
+        if (g_str_has_prefix(caps_struct_name, "video/x-h265")) {
+            parse = gst_element_factory_make("h265parse", "h265parse_file");
+        } else if (g_str_has_prefix(caps_struct_name, "video/x-h264")) {
+            parse = gst_element_factory_make("h264parse", "h264parse_file");
+        }
+        // ... 其他文件视频格式 ...
+
+        if (parse) {
+            gst_bin_add(GST_BIN(data->pipeline), parse);
+            gst_element_sync_state_with_parent(parse);
+            target_sink_pad = gst_element_get_static_pad(parse, "sink");
+            if (gst_pad_link(new_pad, target_sink_pad) != GST_PAD_LINK_OK) {
+                g_printerr("Failed to link demuxer new video pad to parser sink pad.\n");
+                gst_object_unref(target_sink_pad);
+                goto exit;
+            }
+            gst_object_unref(target_sink_pad);
+            if (!gst_element_link(parse, data->decoder)) {
+                g_printerr("Failed to link file parser to decoder.\n");
+                goto exit;
+            }
+            g_print("Successfully linked file video stream to decoder.\n");
+
+            // 为 decoder 的 src pad 添加 probe (如果之前 RTSP 未添加)
+            static gboolean video_decoder_probe_added_file = FALSE; // Use a different flag if needed or combine
+            if (!video_decoder_probe_added_file) { // Or check the global one
+                GstPad *decoder_src_pad = gst_element_get_static_pad(data->decoder, "src");
+                if (decoder_src_pad) {
+                    gst_pad_add_probe(decoder_src_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, decoder_caps_event_probe, data, NULL);
+                    gst_object_unref(decoder_src_pad);
+                    video_decoder_probe_added_file = TRUE;
+                }
+            }
+        } else {
+            g_warning("Unsupported file video format: %s", caps_struct_name);
+        }
+    } else {
+        g_warning("Pad added from unexpected element: %s", src_element_name);
+    }
+
+    exit:
     if (new_pad_caps != NULL) gst_caps_unref(new_pad_caps);
-    if (sink_pad != NULL) gst_object_unref(sink_pad);
+    // GstPad* target_sink_pad 是在 if 块内声明和 unref 的，这里不需要再 unref sink_pad (全局的)
+    // 除非你之前有其他地方获取了全局的 sink_pad 并且没有释放
+    // 原始代码中的 if (sink_pad != NULL) gst_object_unref(sink_pad); 需要检查 sink_pad 的作用域和生命周期
 }
+
 
 /**
  * @brief Callback function to handle messages from the bus (like errors, EOS).
@@ -111,11 +296,11 @@ exit:
 static gboolean on_bus_message(GstBus *bus, GstMessage *msg, CustomData *data) {
     switch (GST_MESSAGE_TYPE(msg)) {
         case GST_MESSAGE_ERROR: {
-            GError *err;
-            gchar *debug_info;
+            GError *err = NULL;
+            gchar *debug_info = NULL;
             gst_message_parse_error(msg, &err, &debug_info);
-            g_printerr("Error received from element %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
-            g_printerr("Debugging information: %s\n", debug_info ? debug_info : "none");
+            g_printerr("ERROR from element %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
+            g_printerr("Debugging info: %s\n", debug_info ? debug_info : "none");
             g_clear_error(&err);
             g_free(debug_info);
             g_main_loop_quit(data->main_loop);
@@ -123,13 +308,41 @@ static gboolean on_bus_message(GstBus *bus, GstMessage *msg, CustomData *data) {
         }
         case GST_MESSAGE_EOS:
             g_print("End-Of-Stream reached.\n");
-            g_main_loop_quit(data->main_loop);
+            if (!data->is_eos_handling_active) { // Only loop local files
+                data->is_eos_handling_active = TRUE;
+                g_print("Looping video: Seeking to start...\n");
+                if (!gst_element_seek_simple(data->pipeline, GST_FORMAT_TIME,
+                                             (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT), (gint64)0)) {
+                    g_printerr("Seek failed! Quitting loop.\n");
+                    g_main_loop_quit(data->main_loop);
+                }
+            } else if (data->is_eos_handling_active) {
+                g_print("EOS received while already handling a previous EOS/seek, ignoring.\n");
+            } else { // EOS from RTSP or looping disabled for this source
+                g_print("EOS from RTSP source or looping not enabled. Quitting.\n");
+                g_main_loop_quit(data->main_loop);
+            }
             break;
+        case GST_MESSAGE_ASYNC_DONE:
+            g_print("Async operation (e.g., seek) completed.\n");
+            if (data->is_eos_handling_active) {
+                g_print("Resetting EOS handling flag after seek completion.\n");
+                data->is_eos_handling_active = FALSE;
+            }
+            break;
+        case GST_MESSAGE_STATE_CHANGED: {
+            GstState old_state, new_state, pending_state;
+            gst_message_parse_state_changed(msg, &old_state, &new_state, &pending_state);
+            if (GST_MESSAGE_SRC(msg) == GST_OBJECT(data->pipeline)) {
+                g_print("Pipeline state changed from %s to %s.\n",
+                        gst_element_state_get_name(old_state),
+                        gst_element_state_get_name(new_state));
+            }
+            break;
+        }
         default:
-            // We are not interested in other messages
             break;
     }
-    // Return TRUE to keep the bus watch active
     return TRUE;
 }
 // Function to draw a rectangle on an RGB frame
@@ -481,7 +694,6 @@ static GstPadProbeReturn process_frame_callback(GstPad *pad, GstPadProbeInfo *in
         guint8 *rgba_frame = map.data; // Pointer to RGB data
 
         gettimeofday(&start_time, NULL);
-        g_print("gst_buffer_map ...\n");
         // Resize the frame using RGA
         // rga_buffer_handle_t src_handle = importbuffer_virtualaddr(rgba_frame, RENDERING_WIDTH * RENDERING_HEIGHT * RENDERING_CHANNEL);
         // rga_buffer_handle_t dst_handle = importbuffer_virtualaddr(G_DIST_BUFFER, RKNN_WIDTH * RKNN_HEIGHT * RKNN_CHANNEL);
@@ -491,19 +703,17 @@ static GstPadProbeReturn process_frame_callback(GstPad *pad, GstPadProbeInfo *in
         //     return GST_PAD_PROBE_OK;
         // }
 
-         
-        // rga_buffer_t src_img = wrapbuffer_handle(src_handle, RENDERING_WIDTH, RENDERING_HEIGHT, RK_FORMAT_BGRA_8888);
-        // rga_buffer_t dst_img = wrapbuffer_handle(dst_handle, RKNN_WIDTH, RKNN_HEIGHT, RK_FORMAT_RGB_888);
-
+        // 使用自适应宽高
+        int frame_width = g_rendering_width > 0 ? g_rendering_width : RENDERING_WIDTH;
+        int frame_height = g_rendering_height > 0 ? g_rendering_height : RENDERING_HEIGHT;
         rga_buffer_t src_img = {0};
         rga_buffer_t dst_img = {0};
         src_img.vir_addr = (void *)rgba_frame; 
-        src_img.width = RENDERING_WIDTH;
-        src_img.height = RENDERING_HEIGHT;
+        src_img.width = frame_width;
+        src_img.height = frame_height;
         src_img.format = RK_FORMAT_RGBA_8888;
-        src_img.wstride = RENDERING_WIDTH; 
-        src_img.hstride = RENDERING_HEIGHT;
-
+        src_img.wstride = frame_width; 
+        src_img.hstride = frame_height;
         dst_img.vir_addr = (void *)G_DIST_BUFFER;
         dst_img.width = RKNN_WIDTH;
         dst_img.height = RKNN_HEIGHT;
@@ -525,8 +735,8 @@ static GstPadProbeReturn process_frame_callback(GstPad *pad, GstPadProbeInfo *in
             return GST_PAD_PROBE_OK;
         }
 
-        float scale_w = (float)RKNN_WIDTH / RENDERING_WIDTH;
-        float scale_h = (float)RKNN_HEIGHT / RENDERING_HEIGHT;
+        float scale_w = (float)RKNN_WIDTH / frame_width;
+        float scale_h = (float)RKNN_HEIGHT / frame_height;
 
         rknn_input inputs[1];
         memset(inputs, 0, sizeof(inputs));
@@ -566,19 +776,18 @@ static GstPadProbeReturn process_frame_callback(GstPad *pad, GstPadProbeInfo *in
             detect_result_t *det_result = &(detect_result_group.results[i]);
 
             // Draw a box on the RGB frame
-            draw_box_on_rgba_frame(rgba_frame, RENDERING_WIDTH, RENDERING_HEIGHT, det_result->box.left, det_result->box.top,
+            draw_box_on_rgba_frame(rgba_frame, frame_width, frame_height, det_result->box.left, det_result->box.top,
                                    det_result->box.right - det_result->box.left, det_result->box.bottom - det_result->box.top);
 
             // Draw text using FreeType
-            draw_text_on_rgba_frame_freetype(rgba_frame, "./simsun.ttc", RENDERING_WIDTH, RENDERING_HEIGHT, det_result->name,
+            draw_text_on_rgba_frame_freetype(rgba_frame, "./simsun.ttc", frame_width, frame_height, det_result->name,
                                              det_result->box.left, det_result->box.top);
         }
 
-        // save_image_to_disk("output.png", rgba_frame, RENDERING_WIDTH, RENDERING_HEIGHT);
+        // save_image_to_disk("output.png", rgba_frame, frame_width, frame_height);
 
         gettimeofday(&stop_time, NULL);
         std::cout << "Inference time: " << (__get_us(stop_time) - __get_us(start_time)) / 1000 << " ms" << std::endl;
-        g_print("gst_buffer_map out...\n");
         rknn_outputs_release(G_RKNN_CONTEXT, G_IO_NUM.n_output, outputs);
 
         // Unmap when done
@@ -587,7 +796,6 @@ static GstPadProbeReturn process_frame_callback(GstPad *pad, GstPadProbeInfo *in
 
     return GST_PAD_PROBE_OK;
 }
-
 // --- Main Function ---
 int main(int argc, char *argv[]) {
     CustomData data = {0}; // Initialize our data structure to zeros
@@ -612,7 +820,9 @@ int main(int argc, char *argv[]) {
     data.pipeline = gst_pipeline_new("video-pipeline");
 
     // a. Common elements (used in both modes)
-    data.parse = gst_element_factory_make("h264parse", "parse");
+    // 不提前创建 parse/depay，后续动态创建
+    data.parse = NULL;
+    data.depay = NULL;
     data.decoder = gst_element_factory_make("mppvideodec", "decoder");
     data.videoscale = gst_element_factory_make("videoscale", "videoscale");
     data.scale_capsfilter = gst_element_factory_make("capsfilter", "scale_capsfilter");
@@ -623,34 +833,36 @@ int main(int argc, char *argv[]) {
     // --- 2. Determine URI type and build the data source ---
     if (g_str_has_prefix(uri, "rtsp://")) {
         g_print("Input is an RTSP stream. Building network pipeline...\n");
-        // b. RTSP-specific elements
         data.source = gst_element_factory_make("rtspsrc", "rtspsrc");
-        data.depay = gst_element_factory_make("rtph264depay", "depay");
         g_object_set(data.source, "location", uri, NULL);
-
+        //g_object_set(data.source, "protocols", 4, NULL); // 强制使用TCP
+        gst_bin_add(GST_BIN(data.pipeline), data.source);
+        g_signal_connect(data.source, "pad-added", G_CALLBACK(on_pad_added), &data);
     } else {
         g_print("Input is a local file. Building file pipeline...\n");
-        // c. Local file-specific elements
         data.source = gst_element_factory_make("filesrc", "filesrc");
         data.demuxer = gst_element_factory_make("qtdemux", "demuxer");
         g_object_set(data.source, "location", uri, NULL);
+        gst_bin_add_many(GST_BIN(data.pipeline), data.source, data.demuxer, NULL);
+        gst_element_link(data.source, data.demuxer);
+        g_signal_connect(data.demuxer, "pad-added", G_CALLBACK(on_pad_added), &data);
     }
 
     // Check if all elements were created successfully
-    if (!data.pipeline || !data.source || !data.parse || !data.decoder || !data.videoscale || !data.scale_capsfilter ||
+    if (!data.pipeline || !data.source || !data.decoder || !data.videoscale || !data.scale_capsfilter ||
         !data.videoconvert || !data.sink) {
         g_error("Failed to create one or more elements");
         return -1;
     }
-    if ((!data.depay && g_str_has_prefix(uri, "rtsp://")) || (!data.demuxer && !g_str_has_prefix(uri, "rtsp://"))){
-        g_error("Failed to create source-specific elements");
+    // 只检查本地文件场景的 demuxer
+    if (!data.demuxer && !g_str_has_prefix(uri, "rtsp://")){
+        g_error("Failed to create demuxer for local file");
         return -1;
     }
-
-    g_print("Input is a local file.configure caps...\n");
     // --- 3. Configure Caps and Properties ---
     GstCaps *scale_caps = gst_caps_new_simple("video/x-raw", "width", G_TYPE_INT, RENDERING_WIDTH,
-                                              "height", G_TYPE_INT, RENDERING_HEIGHT, NULL);
+                                              "height", G_TYPE_INT, RENDERING_HEIGHT,
+                                              "pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1, NULL);
     g_object_set(data.scale_capsfilter, "caps", scale_caps, NULL);
     gst_caps_unref(scale_caps);
 
@@ -673,10 +885,11 @@ int main(int argc, char *argv[]) {
     g_value_unset(&render_rectangle);
 
     // --- 4. Add and link the common elements ---
-    gst_bin_add_many(GST_BIN(data.pipeline), data.parse, data.decoder, data.videoscale, data.scale_capsfilter,
+    // parse/depay 后续动态创建
+    gst_bin_add_many(GST_BIN(data.pipeline), data.decoder, data.videoscale, data.scale_capsfilter,
                      data.videoconvert, data.rgb_capsfilter, data.sink, NULL);
 
-    if (!gst_element_link_many(data.parse, data.decoder, data.videoscale, data.scale_capsfilter,
+    if (!gst_element_link_many(data.decoder, data.videoscale, data.scale_capsfilter,
                                data.videoconvert, data.rgb_capsfilter, data.sink, NULL)) {
         g_error("Failed to link common elements");
         gst_object_unref(data.pipeline);
@@ -684,15 +897,8 @@ int main(int argc, char *argv[]) {
     }
 
     // --- 2. Determine URI type and build the data source ---
-    if (g_str_has_prefix(uri, "rtsp://")) {
-        g_print("Input is an RTSP stream. Building network pipeline...\n");
-        gst_bin_add_many(GST_BIN(data.pipeline), data.source, data.depay, NULL);
-        gst_element_link(data.depay, data.parse);
-        g_signal_connect(data.source, "pad-added", G_CALLBACK(on_pad_added), &data);
-
-    } else {
+    if (!g_str_has_prefix(uri, "rtsp://")) {
         g_print("Input is a local file. Building file pipeline...\n");
-
         gst_bin_add_many(GST_BIN(data.pipeline), data.source, data.demuxer, NULL);
         gst_element_link(data.source, data.demuxer);
         g_signal_connect(data.demuxer, "pad-added", G_CALLBACK(on_pad_added), &data);
